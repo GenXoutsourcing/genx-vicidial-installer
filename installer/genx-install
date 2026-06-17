@@ -1,0 +1,67 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# GenX VICIdial Installer launcher
+#
+# Target command: genx-install
+# Initial v1 scope: Express server only (DB + Web + Telephony)
+# Future roles are intentionally shown but disabled until Express is proven.
+# -----------------------------------------------------------------------------
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+EXPRESS_SCRIPT="$SCRIPT_DIR/stage1-express.sh"
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "ERROR: Run this installer as root."
+    exit 1
+fi
+
+if [[ ! -x "$EXPRESS_SCRIPT" ]]; then
+    echo "ERROR: Missing or non-executable: $EXPRESS_SCRIPT"
+    exit 1
+fi
+
+cat <<'BANNER'
+==================================================
+ GenX VICIdial Installer for AlmaLinux 9
+==================================================
+
+Installer v1 focus:
+  Express Server = Database + Web + Telephony
+
+Future roles:
+  Database Master
+  Database Slave
+  Web Server
+  Telephony Server
+  Archive Server
+
+BANNER
+
+PS3="Select install role: "
+select ROLE in \
+    "Express Server - DB + Web + Telephony" \
+    "Database Master - planned" \
+    "Database Slave - planned" \
+    "Web Server - planned" \
+    "Telephony Server - planned" \
+    "Archive Server - planned" \
+    "Quit"; do
+    case "$REPLY" in
+        1)
+            exec "$EXPRESS_SCRIPT" --repo-root "$REPO_ROOT"
+            ;;
+        2|3|4|5|6)
+            echo "This role is planned for a later phase. Build and test Express first."
+            ;;
+        7)
+            echo "Exiting."
+            exit 0
+            ;;
+        *)
+            echo "Invalid selection."
+            ;;
+    esac
+done
