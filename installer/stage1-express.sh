@@ -52,6 +52,7 @@ RANDOM_AUTH=""
 SVN_REVISION=""
 RECORDING_RETENTION_DAYS=""
 GENX_TZ=""
+LETSENCRYPT_STAGING=""
 
 # Shared logging. genx-install passes --log-file; if run directly, use default.
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -182,6 +183,18 @@ prompt_server_info() {
     RECORDING_RETENTION_DAYS="${RECORDING_RETENTION_DAYS:-65}"
     [[ "$RECORDING_RETENTION_DAYS" =~ ^[0-9]+$ ]] || die "Recording retention must be a number of days."
 
+    echo
+    echo "Let's Encrypt certificate mode:"
+    echo "  1) Staging / sandbox certificate - recommended for installer testing"
+    echo "  2) Production certificate"
+    read -rp "Certificate mode [1]: " CERT_MODE
+    CERT_MODE="${CERT_MODE:-1}"
+    case "$CERT_MODE" in
+        1) LETSENCRYPT_STAGING="Y" ;;
+        2) LETSENCRYPT_STAGING="N" ;;
+        *) log "Invalid certificate mode '$CERT_MODE'. Using staging/sandbox."; LETSENCRYPT_STAGING="Y" ;;
+    esac
+
     GENX_TZ="$(get_system_timezone)"
     [[ -n "$GENX_TZ" ]] || GENX_TZ="America/New_York"
 
@@ -232,6 +245,7 @@ ADMIN_EMAIL=$ADMIN_EMAIL
 PUBLIC_IP=$PUBLIC_IP
 PRIVATE_IP=$(get_primary_private_ip)
 TIMEZONE=$GENX_TZ
+LETSENCRYPT_STAGING=$LETSENCRYPT_STAGING
 
 MYSQL_ROOT_PASS=$MYSQL_ROOT_PASS
 VICIDIAL_DB=asterisk
@@ -481,7 +495,9 @@ install_dahdi() {
     grep -rl "static int .*_match(struct device \*dev, struct device_driver \*driver)" linux/drivers/dahdi | xargs -r sed -i 's|\(static int [a-zA-Z0-9_]*_match(struct device \*dev, \)struct device_driver \*driver)|\1const struct device_driver *driver)|g'
     sed -i 's/class_create(THIS_MODULE, "dahdi")/class_create("dahdi")/' linux/drivers/dahdi/dahdi-sysfs-chan.c || true
 
-    make clean
+    # Top-level "make clean" can fail because tools/ may not have a clean target.
+    # Clean Linux modules only and continue safely.
+    make -C linux clean || true
     make all -j"$(nproc)"
     make install
     make install-config
@@ -489,7 +505,7 @@ install_dahdi() {
 
     if [[ -d tools ]]; then
         cd tools
-        make clean
+        make clean || true
         make -j"$(nproc)"
         make install
         make install-config
@@ -585,8 +601,9 @@ FLUSH PRIVILEGES;
 SET GLOBAL connect_timeout=60;
 SQL_VICI
 
-    mysql asterisk < /usr/src/astguiclient/trunk/extras/MySQL_AST_CREATE_tables.sql
-    mysql asterisk < /usr/src/astguiclient/trunk/extras/first_server_install.sql
+    # Use --force so reruns continue if tables already exist from a previous failed test run.
+    mysql --force asterisk < /usr/src/astguiclient/trunk/extras/MySQL_AST_CREATE_tables.sql
+    mysql --force asterisk < /usr/src/astguiclient/trunk/extras/first_server_install.sql
 
     local ip_address
     ip_address="$(get_primary_private_ip)"
@@ -820,21 +837,44 @@ configure_ssl_webrtc() {
     echo " Configuring Let's Encrypt SSL and WebRTC"
     echo "=================================================="
 
+    # Certbot/apache requires a plain port 80 VirtualHost for HTTP-01 validation.
+    # This is intentionally minimal. Certbot will create the SSL vhost.
+    cat > /etc/httpd/conf.d/00-genx-certbot.conf <<EOF_CERTBOT_VHOST
+<VirtualHost *:80>
+    ServerName ${FQDN}
+    DocumentRoot /var/www/html
+
+    <Directory /var/www/html>
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+EOF_CERTBOT_VHOST
+
+    # Express v1 does not install ViciBox SSL vhosts. They reference openSUSE paths,
+    # self-signed ViciBox certs, and optional modules not present on EL9.
+    rm -f /etc/httpd/conf.d/genx-*ssl*.conf
+    rm -f /etc/httpd/conf.d/genx-dynportal-ssl.conf
+
+    httpd -t
     systemctl restart httpd
 
-    certbot --apache -d "$FQDN" -m "$ADMIN_EMAIL" --agree-tos --non-interactive --redirect
-
-    # Now that Let\'s Encrypt certificates exist, install any bundled SSL Apache configs.
-    if [[ -d "$REPO_ROOT/assets/apache" ]]; then
-        for f in "$REPO_ROOT"/assets/apache/*ssl*.conf; do
-            [[ -f "$f" ]] || continue
-            base="$(basename "$f")"
-            cp -f "$f" "/etc/httpd/conf.d/genx-$base"
-            sed -i 's|/srv/www/vhosts|/var/www/vhosts|g; s|/etc/apache2|/etc/httpd|g; s|apache2|httpd|g' "/etc/httpd/conf.d/genx-$base"
-            sed -i "s|DOMAINNAME|$FQDN|g" "/etc/httpd/conf.d/genx-$base"
-        done
-        systemctl restart httpd
+    CERTBOT_STAGING_FLAG=""
+    if [[ "$LETSENCRYPT_STAGING" == "Y" ]]; then
+        CERTBOT_STAGING_FLAG="--staging"
+        log "Using Let's Encrypt STAGING / sandbox certificate"
+    else
+        log "Using Let's Encrypt PRODUCTION certificate"
     fi
+
+    certbot --apache ${CERTBOT_STAGING_FLAG} -d "$FQDN" -m "$ADMIN_EMAIL" --agree-tos --non-interactive --redirect
+
+    # Certbot creates the SSL vhost. Do not copy bundled ViciBox SSL configs here.
+    rm -f /etc/httpd/conf.d/genx-*ssl*.conf
+    rm -f /etc/httpd/conf.d/genx-dynportal-ssl.conf
+
+    httpd -t
+    systemctl restart httpd
 
     # Enable whatever certbot timer exists on this EL9 build.
     if systemctl list-unit-files | grep -q '^certbot-renew.timer'; then
