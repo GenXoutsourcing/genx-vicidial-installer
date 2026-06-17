@@ -15,7 +15,7 @@
 #   - ViciBox-style cron/rc.local behavior
 #
 # Troubleshooting:
-#   Main log: /var/log/genx-stage1-express.log
+#   Main log: /var/log/genx-install.log
 #   Saved credentials: /root/genx-install-info.txt
 #
 # Important:
@@ -25,16 +25,21 @@
 
 set -Eeuo pipefail
 
-LOG_FILE="/var/log/genx-stage1-express.log"
+# -----------------------------
+# Global defaults
+# -----------------------------
+LOG_FILE="/var/log/genx-install.log"
 INFO_FILE="/root/genx-install-info.txt"
 BUILD_DIR="/usr/src/genx-build"
 VICIDIAL_SVN="svn://svn.eflo.net/agc_2-X/trunk"
-ASTERISK_VERSION="18.21.0"
+ASTERISK_SOURCE_VERSION="18.21.0"
+ASTERISK_VICIDIAL_VERSION="18"
 DAHDI_VERSION="3.4.0+3.4.0"
 MARIADB_VERSION="10.11"
 PHP_STREAM="remi-8.2"
+INSTALLER_VERSION="unknown"
 
-# Defaults; replaced by prompts.
+# Runtime values; filled by args/prompts.
 REPO_ROOT=""
 FQDN=""
 ADMIN_EMAIL=""
@@ -46,18 +51,52 @@ VICI_CUSTOM_PASS=""
 RANDOM_AUTH=""
 SVN_REVISION=""
 RECORDING_RETENTION_DAYS=""
+GENX_TZ=""
 
+# Shared logging. genx-install passes --log-file; if run directly, use default.
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
-trap 'echo "ERROR: Express install failed on line $LINENO. See $LOG_FILE" >&2' ERR
+
+log() {
+    echo "$(date '+%F %T') [stage1-express v${INSTALLER_VERSION}] $*"
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+on_error() {
+    local exit_code=$?
+    local line_no=$1
+    log "FAILED: command exited with code $exit_code at line $line_no"
+    log "Review log: $LOG_FILE"
+    exit "$exit_code"
+}
+
+trap 'on_error $LINENO' ERR
 
 usage() {
-    echo "Usage: $0 --repo-root /path/to/genx-vicidial-installer"
+    cat <<EOF_USAGE
+Usage: $0 --repo-root /path/to/genx-vicidial-installer [--version VERSION] [--log-file FILE]
+EOF_USAGE
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo-root)
-            REPO_ROOT="$2"
+            REPO_ROOT="${2:-}"
+            shift 2
+            ;;
+        --version)
+            INSTALLER_VERSION="${2:-unknown}"
+            shift 2
+            ;;
+        --log-file)
+            LOG_FILE="${2:-/var/log/genx-install.log}"
+            mkdir -p "$(dirname "$LOG_FILE")"
+            touch "$LOG_FILE"
             shift 2
             ;;
         -h|--help)
@@ -65,33 +104,24 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            echo "Unknown option: $1"
-            usage
-            exit 1
+            die "Unknown option: $1"
             ;;
     esac
 done
 
 require_root() {
-    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-        echo "ERROR: Run this script as root."
-        exit 1
-    fi
+    [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run this script as root."
 }
 
 require_el9() {
     if [[ ! -f /etc/redhat-release ]] || ! grep -Eq 'release 9\.' /etc/redhat-release; then
-        echo "ERROR: This installer targets AlmaLinux/Rocky/RHEL 9 only."
         cat /etc/redhat-release 2>/dev/null || true
-        exit 1
+        die "This installer targets AlmaLinux/Rocky/RHEL 9 only."
     fi
 }
 
 require_repo_assets() {
-    if [[ -z "$REPO_ROOT" || ! -d "$REPO_ROOT" ]]; then
-        echo "ERROR: --repo-root is required and must point to the Git repository."
-        exit 1
-    fi
+    [[ -n "$REPO_ROOT" && -d "$REPO_ROOT" ]] || die "--repo-root is required and must point to the Git repository."
 
     local missing=0
     for path in \
@@ -101,15 +131,12 @@ require_repo_assets() {
         "$REPO_ROOT/assets/firewall" \
         "$REPO_ROOT/assets/vicibox/cron"; do
         if [[ ! -d "$path" ]]; then
-            echo "ERROR: Missing asset directory: $path"
+            log "Missing asset directory: $path"
             missing=1
         fi
     done
 
-    if [[ "$missing" -eq 1 ]]; then
-        echo "Repository assets are incomplete. Fix GitHub checkout before continuing."
-        exit 1
-    fi
+    [[ "$missing" -eq 0 ]] || die "Repository assets are incomplete. Fix GitHub checkout before continuing."
 }
 
 random_password() {
@@ -122,7 +149,14 @@ get_primary_private_ip() {
 }
 
 get_public_ip() {
-    curl -fsS4 https://ifconfig.me 2>/dev/null || curl -fsS4 https://api.ipify.org 2>/dev/null || true
+    # Multiple providers to avoid one failed endpoint stopping the install.
+    curl -4 -fsS https://ifconfig.me 2>/dev/null || \
+    curl -4 -fsS https://api.ipify.org 2>/dev/null || \
+    curl -4 -fsS https://icanhazip.com 2>/dev/null | tr -d '[:space:]' || true
+}
+
+get_system_timezone() {
+    timedatectl show -p Timezone --value 2>/dev/null || echo "America/New_York"
 }
 
 prompt_server_info() {
@@ -146,9 +180,14 @@ prompt_server_info() {
 
     read -rp "Recording retention in days [65]: " RECORDING_RETENTION_DAYS
     RECORDING_RETENTION_DAYS="${RECORDING_RETENTION_DAYS:-65}"
+    [[ "$RECORDING_RETENTION_DAYS" =~ ^[0-9]+$ ]] || die "Recording retention must be a number of days."
 
-    echo "Setting hostname to $FQDN"
+    GENX_TZ="$(get_system_timezone)"
+    [[ -n "$GENX_TZ" ]] || GENX_TZ="America/New_York"
+
+    log "Setting hostname to $FQDN"
     hostnamectl set-hostname "$FQDN"
+    log "Using PHP/application timezone: $GENX_TZ"
 }
 
 validate_dns() {
@@ -167,18 +206,13 @@ validate_dns() {
     echo "Server public IP: ${PUBLIC_IP:-UNKNOWN}"
     echo
 
-    if [[ -z "$PUBLIC_IP" || -z "$DNS_IPS" ]]; then
-        echo "ERROR: Could not determine public IP or DNS A record."
-        exit 1
-    fi
+    [[ -n "$PUBLIC_IP" && -n "$DNS_IPS" ]] || die "Could not determine public IP or DNS A record."
 
     if ! echo "$DNS_IPS" | grep -Fxq "$PUBLIC_IP"; then
-        echo "ERROR: DNS for $FQDN does not resolve to this server's public IP."
-        echo "Fix the DNS A record, wait for propagation, then rerun."
-        exit 1
+        die "DNS for $FQDN does not resolve to this server's public IP. Fix DNS A record, wait for propagation, then rerun."
     fi
 
-    echo "DNS validation passed."
+    log "DNS validation passed"
 }
 
 save_install_info_header() {
@@ -190,12 +224,14 @@ save_install_info_header() {
     umask 077
     cat > "$INFO_FILE" <<EOF_INFO
 GenX VICIdial Express Install
+Installer Version: ${INSTALLER_VERSION}
 Generated: $(date)
 
 FQDN=$FQDN
 ADMIN_EMAIL=$ADMIN_EMAIL
 PUBLIC_IP=$PUBLIC_IP
 PRIVATE_IP=$(get_primary_private_ip)
+TIMEZONE=$GENX_TZ
 
 MYSQL_ROOT_PASS=$MYSQL_ROOT_PASS
 VICIDIAL_DB=asterisk
@@ -219,14 +255,14 @@ install_repos_and_base_packages() {
     dnf -y install dnf-plugins-core epel-release yum-utils
     dnf config-manager --set-enabled crb || true
 
-    # Remi provides the requested PHP 8.2 stream on EL9.
+    # Remi provides PHP 8.2 stream on EL9.
     if [[ ! -f /etc/yum.repos.d/remi.repo ]]; then
         dnf -y install https://rpms.remirepo.net/enterprise/remi-release-9.rpm
     fi
     dnf -y module reset php
     dnf -y module enable php:${PHP_STREAM}
 
-    # MariaDB official repo for 10.11. Fallback to distro packages happens later if needed.
+    # MariaDB official repo for 10.11.
     cat > /etc/yum.repos.d/MariaDB.repo <<EOF_MDB
 [mariadb]
 name = MariaDB
@@ -236,7 +272,8 @@ gpgcheck = 1
 module_hotfixes = 1
 EOF_MDB
 
-    dnf -y makecache
+    log "Refreshing package cache"
+    dnf -y makecache || die "dnf makecache failed. Check MariaDB/Remi/EPEL repository access."
 
     dnf -y groupinstall "Development Tools"
     dnf -y install \
@@ -274,11 +311,10 @@ install_mariadb() {
     fi
 
     mkdir -p /etc/my.cnf.d
-    # Install ViciBox-style split MariaDB configs from Git assets.
-    # User decision: keep Alma default data path /var/lib/mysql, not /srv/mysql/data.
     for f in cache-buffers.cnf general.cnf innodb.cnf replication.cnf; do
         if [[ -f "$REPO_ROOT/assets/mariadb/$f" ]]; then
             cp -f "$REPO_ROOT/assets/mariadb/$f" "/etc/my.cnf.d/genx-$f"
+            # User decision: Alma default data path /var/lib/mysql, not ViciBox /srv/mysql/data.
             sed -i 's|/srv/mysql/data|/var/lib/mysql|g' "/etc/my.cnf.d/genx-$f"
         fi
     done
@@ -288,6 +324,9 @@ install_mariadb() {
     chown -R mysql:mysql /var/log/mysqld || true
 
     systemctl restart mariadb
+
+    # Load MySQL timezone tables for VICIdial reports/time logic.
+    mysql_tzinfo_to_sql /usr/share/zoneinfo | mysql mysql || true
 
     # Secure root for a new install and create /root/.my.cnf for non-interactive admin commands.
     mysql -uroot <<SQL_ROOT || true
@@ -315,7 +354,7 @@ install_php_httpd() {
     echo " Configuring Apache/httpd and PHP 8.2"
     echo "=================================================="
 
-    cat > /etc/php.d/99-vicidial.ini <<'EOF_PHP'
+    cat > /etc/php.d/99-vicidial.ini <<EOF_PHP
 ; VICIdial settings installed by GenX installer
 error_reporting = E_ALL & ~E_NOTICE
 memory_limit = 448M
@@ -325,11 +364,10 @@ max_input_time = 3360
 post_max_size = 448M
 upload_max_filesize = 442M
 default_socket_timeout = 3360
-date.timezone = America/New_York
+date.timezone = ${GENX_TZ}
 max_input_vars = 50000
 EOF_PHP
 
-    # General recording alias for local playback.
     if ! grep -q '# BEGIN VICIDIAL RECORDINGS ALIAS' /etc/httpd/conf/httpd.conf; then
         cat >> /etc/httpd/conf/httpd.conf <<'EOF_HTTPD'
 
@@ -346,7 +384,6 @@ Timeout 600
 EOF_HTTPD
     fi
 
-    # Copy Apache assets if available; sed converts openSUSE apache paths to EL httpd paths.
     if [[ -d "$REPO_ROOT/assets/apache" ]]; then
         for f in "$REPO_ROOT"/assets/apache/*.conf; do
             [[ -f "$f" ]] || continue
@@ -423,7 +460,6 @@ install_dahdi() {
     cd "dahdi-linux-complete-${DAHDI_VERSION}"
 
     # Alma/Rocky 9.5+/9.6+ kernel compatibility patches.
-    # These replace the old demo-server dahdi-9.5-fix.zip dependency.
     grep -rl 'DEFINE_SEMAPHORE(' linux/ | xargs -r sed -i 's/DEFINE_SEMAPHORE(\([a-zA-Z0-9_]\+\))/DEFINE_SEMAPHORE(\1, 1)/g'
     grep -rl 'from_timer' linux/drivers/dahdi | xargs -r sed -i 's/from_timer(\([^,]*\), \([^,]*\), \([^)]*\))/timer_container_of(\1, \2, \3)/g'
 
@@ -463,7 +499,7 @@ install_dahdi() {
 install_asterisk() {
     echo
     echo "=================================================="
-    echo " Installing Asterisk ${ASTERISK_VERSION} from official source"
+    echo " Installing Asterisk ${ASTERISK_SOURCE_VERSION} from official source"
     echo "=================================================="
 
     mkdir -p "$BUILD_DIR/asterisk"
@@ -478,11 +514,11 @@ install_asterisk() {
     make install
 
     cd "$BUILD_DIR/asterisk"
-    wget -N "https://downloads.asterisk.org/pub/telephony/asterisk/old-releases/asterisk-${ASTERISK_VERSION}.tar.gz" || \
-        wget -N "https://downloads.asterisk.org/pub/telephony/asterisk/asterisk-${ASTERISK_VERSION}.tar.gz"
-    rm -rf "asterisk-${ASTERISK_VERSION}"
-    tar xzf "asterisk-${ASTERISK_VERSION}.tar.gz"
-    cd "asterisk-${ASTERISK_VERSION}"
+    wget -N "https://downloads.asterisk.org/pub/telephony/asterisk/old-releases/asterisk-${ASTERISK_SOURCE_VERSION}.tar.gz" || \
+        wget -N "https://downloads.asterisk.org/pub/telephony/asterisk/asterisk-${ASTERISK_SOURCE_VERSION}.tar.gz"
+    rm -rf "asterisk-${ASTERISK_SOURCE_VERSION}"
+    tar xzf "asterisk-${ASTERISK_SOURCE_VERSION}.tar.gz"
+    cd "asterisk-${ASTERISK_SOURCE_VERSION}"
 
     ./configure --libdir=/usr/lib64 --with-gsm=internal --enable-opus --enable-srtp --with-ssl --enable-asteriskssl --with-pjproject-bundled --with-jansson-bundled
     make menuselect/menuselect menuselect-tree menuselect.makeopts
@@ -516,7 +552,7 @@ install_vicidial_source_and_db() {
 
     cd /usr/src/astguiclient/trunk
     SVN_REVISION="$(svn info 2>/dev/null | awk '/^Revision:/ {print $2}')"
-    echo "VICIdial SVN revision: ${SVN_REVISION:-unknown}"
+    log "VICIdial SVN revision: ${SVN_REVISION:-unknown}"
     echo "SVN_REVISION=${SVN_REVISION:-unknown}" >> "$INFO_FILE"
 
     mysql <<SQL_VICI
@@ -583,7 +619,7 @@ VARfastagi_log_checkforwait => 60
 ExpectedDBSchema => 1720
 EOF_ASTGUI
 
-    perl install.pl --web=/var/www/html --asterisk_version=18 --copy_sample_conf_files --no-prompt --server_ip="$ip_address" \
+    perl install.pl --web=/var/www/html --asterisk_version=${ASTERISK_VICIDIAL_VERSION} --copy_sample_conf_files --no-prompt --server_ip="$ip_address" \
         --DB_database=asterisk --DB_user=cron --DB_pass="$VICI_DB_PASS" \
         --DB_custom_user=custom --DB_custom_pass="$VICI_CUSTOM_PASS" --DB_port=3306
 
@@ -592,7 +628,6 @@ EOF_ASTGUI
     # Secure Asterisk Manager to localhost.
     sed -i 's/0.0.0.0/127.0.0.1/g' /etc/asterisk/manager.conf || true
 
-    # Create ViciBox-compatible provisioning table for future cluster roles.
     mysql asterisk <<SQL_VBOX
 CREATE TABLE IF NOT EXISTS vicibox (
   server_id tinyint(3) unsigned NOT NULL AUTO_INCREMENT,
@@ -617,7 +652,7 @@ INSERT INTO vicibox (server, server_ip, server_type, field1, field2)
 VALUES ('${FQDN}', '${ip_address}', 'Web', '${PUBLIC_IP}', '${RANDOM_AUTH}');
 INSERT INTO vicibox (server, server_ip, server_type, field1)
 VALUES ('${FQDN}', '${ip_address}', 'Telephony', '${PUBLIC_IP}');
-UPDATE servers SET server_description='Server ${FQDN}', asterisk_version='${ASTERISK_VERSION}', conf_secret='${RANDOM_AUTH}', vicidial_balance_active='Y', auto_restart_asterisk='Y', recording_web_link='ALT_IP', alt_server_ip='${FQDN}', conf_engine='CONFBRIDGE' WHERE server_ip='${ip_address}';
+UPDATE servers SET server_description='Server ${FQDN}', asterisk_version='${ASTERISK_VICIDIAL_VERSION}', conf_secret='${RANDOM_AUTH}', vicidial_balance_active='Y', auto_restart_asterisk='Y', recording_web_link='ALT_IP', alt_server_ip='${FQDN}', conf_engine='CONFBRIDGE' WHERE server_ip='${ip_address}';
 UPDATE system_settings SET active_voicemail_server='${ip_address}', webphone_url='https://phone.viciphone.com/viciphone.php', sounds_web_server='https://${FQDN}';
 SQL_VBOX
 }
@@ -744,7 +779,6 @@ install_dynportal_firewall() {
     mkdir -p /usr/share/vicibox-firewall
     cp -a "$REPO_ROOT/assets/firewall/." /usr/share/vicibox-firewall/
 
-    # Install firewall helper command. Support either VB-firewall.pl or VB-firewall asset names.
     if [[ -f /usr/share/vicibox-firewall/VB-firewall.pl ]]; then
         install -m 755 /usr/share/vicibox-firewall/VB-firewall.pl /usr/bin/VB-firewall
     elif [[ -f /usr/share/vicibox-firewall/VB-firewall ]]; then
@@ -777,8 +811,15 @@ configure_ssl_webrtc() {
     systemctl restart httpd
 
     certbot --apache -d "$FQDN" -m "$ADMIN_EMAIL" --agree-tos --non-interactive --redirect
-    systemctl enable certbot-renew.timer || true
-    systemctl start certbot-renew.timer || true
+
+    # Enable whatever certbot timer exists on this EL9 build.
+    if systemctl list-unit-files | grep -q '^certbot-renew.timer'; then
+        systemctl enable certbot-renew.timer || true
+        systemctl start certbot-renew.timer || true
+    elif systemctl list-unit-files | grep -q '^certbot.timer'; then
+        systemctl enable certbot.timer || true
+        systemctl start certbot.timer || true
+    fi
 
     cat > /etc/asterisk/http.conf <<EOF_AHTTP
 [general]
@@ -791,7 +832,6 @@ tlscertfile=/etc/letsencrypt/live/${FQDN}/fullchain.pem
 tlsprivatekey=/etc/letsencrypt/live/${FQDN}/privkey.pem
 EOF_AHTTP
 
-    # Template used for WebRTC phones. Includes context=default fix.
     mysql asterisk <<SQL_WEBRTC
 UPDATE servers SET web_socket_url='wss://${FQDN}:8089/ws';
 UPDATE system_settings SET webphone_url='https://phone.viciphone.com/viciphone.php';
@@ -802,7 +842,6 @@ ALTER TABLE phones MODIFY COLUMN is_webphone ENUM('Y','N','Y_API_LAUNCH') DEFAUL
 UPDATE phones SET template_id='SIP_generic';
 SQL_WEBRTC
 
-    # Add confcron AMI user if missing.
     if ! grep -q '^\[confcron\]' /etc/asterisk/manager.conf; then
         cat >> /etc/asterisk/manager.conf <<'EOF_CONFCron'
 
@@ -856,8 +895,6 @@ install_sounds_and_codecs() {
 
     ln -sfn /var/lib/asterisk/mohmp3 /var/lib/asterisk/default
 
-    # Optional G729 binary from public asterisk.hosting.lv, same source family as existing script.
-    # If it fails, the install continues without G729.
     cd /usr/lib64/asterisk/modules || true
     if [[ -d /usr/lib64/asterisk/modules ]]; then
         wget -N http://asterisk.hosting.lv/bin/codec_g729-ast160-gcc4-glibc-x86_64-core2-sse4.so || true
@@ -887,10 +924,18 @@ main() {
     require_el9
     require_repo_assets
 
-    echo "=================================================="
-    echo " GenX VICIdial Express Installer"
-    echo " Log: $LOG_FILE"
-    echo "=================================================="
+    clear
+    cat <<BANNER
+==================================================
+ GenX VICIdial Express Installer
+ Version: ${INSTALLER_VERSION}
+ Log:     ${LOG_FILE}
+==================================================
+BANNER
+
+    log "Express install started"
+    log "Repository root: $REPO_ROOT"
+    log "Detected OS: $(cat /etc/redhat-release)"
 
     prompt_server_info
     validate_dns
@@ -920,6 +965,7 @@ main() {
     read -rp "Reboot now? [Y/n]: " REBOOT_NOW
     REBOOT_NOW="${REBOOT_NOW:-Y}"
     if [[ "$REBOOT_NOW" =~ ^[Yy]$ ]]; then
+        log "Rebooting server after Express install"
         reboot
     fi
 }
