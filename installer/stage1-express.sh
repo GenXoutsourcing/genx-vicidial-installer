@@ -140,8 +140,8 @@ require_repo_assets() {
 }
 
 random_password() {
-    # 24 chars, shell/mysql friendly; no quotes or spaces.
-    tr -dc 'A-Za-z0-9_@%+=' </dev/urandom | head -c 24
+    # 24 chars, shell/mysql friendly; avoids SIGPIPE/pipefail exit 141.
+    openssl rand -base64 32 | tr -dc 'A-Za-z0-9_@%+=' | cut -c1-24
 }
 
 get_primary_private_ip() {
@@ -262,18 +262,14 @@ install_repos_and_base_packages() {
     dnf -y module reset php
     dnf -y module enable php:${PHP_STREAM}
 
-    # MariaDB official repo for 10.11.
-    cat > /etc/yum.repos.d/MariaDB.repo <<EOF_MDB
-[mariadb]
-name = MariaDB
-baseurl = https://rpm.mariadb.org/${MARIADB_VERSION}/rhel/9/x86_64
-gpgkey = https://rpm.mariadb.org/RPM-GPG-KEY-MariaDB
-gpgcheck = 1
-module_hotfixes = 1
-EOF_MDB
+    # Express v1 uses Alma/Rocky native MariaDB packages.
+    # The official MariaDB 10.11 repo can conflict with Alma mysql-libs/perl-DBD-MySQL.
+    # We will revisit MariaDB 10.11 as a later phase after Express is proven.
+    rm -f /etc/yum.repos.d/MariaDB.repo
 
     log "Refreshing package cache"
-    dnf -y makecache || die "dnf makecache failed. Check MariaDB/Remi/EPEL repository access."
+    dnf -y clean all || true
+    dnf -y makecache || die "dnf makecache failed. Check Remi/EPEL/base repository access."
 
     dnf -y groupinstall "Development Tools"
     dnf -y install \
@@ -301,7 +297,7 @@ install_mariadb() {
     echo " Installing and configuring MariaDB ${MARIADB_VERSION}"
     echo "=================================================="
 
-    dnf -y install MariaDB-server MariaDB-client MariaDB-devel || dnf -y install mariadb-server mariadb mariadb-devel
+    dnf -y install mariadb-server mariadb mariadb-devel perl-DBD-MySQL
 
     systemctl enable mariadb
 
@@ -389,7 +385,7 @@ EOF_HTTPD
             [[ -f "$f" ]] || continue
             base="$(basename "$f")"
 
-            # Do not install SSL vhosts yet. Let\'s Encrypt certs do not exist
+            # Do not install SSL vhosts yet. Let's Encrypt certs do not exist
             # until configure_ssl_webrtc() runs, and Apache can fail to start if
             # an SSL config references missing certificate files.
             if [[ "$base" == *ssl* ]]; then
@@ -402,6 +398,13 @@ EOF_HTTPD
             sed -i "s|DOMAINNAME|$FQDN|g" "/etc/httpd/conf.d/genx-$base"
         done
     fi
+
+    # Alma v1: remove ViciBox/openSUSE optional include files not present on EL9.
+    sed -i '/mod_deflate.conf/d; /mod_cband.portal/d; /mod_php7.conf/d; /mod_php8.conf/d' /etc/httpd/conf.d/genx-dynportal.conf 2>/dev/null || true
+
+    # Alma/PHP-FPM: ViciBox Apache configs may contain mod_php directives.
+    # EL9 Remi PHP 8.2 uses PHP-FPM, so remove php_admin_value/php_value/php_flag.
+    sed -i '/php_admin_value/d; /php_value/d; /php_flag/d' /etc/httpd/conf.d/genx-*.conf 2>/dev/null || true
 
     cat > /var/www/html/index.html <<'EOF_INDEX'
 <META HTTP-EQUIV=REFRESH CONTENT="1; URL=/vicidial/welcome.php">
