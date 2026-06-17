@@ -65,3 +65,13 @@ Database + Web + Telephony
 * css
 * images
 * inc
+
+
+genx-install
+AlmaLinux 9
+Remi PHP 8.2
+MariaDB 10.11
+Asterisk 18.21
+DAHDI 3.4
+/var/lib/mysql
+Required domain + dig verification
