@@ -1,0 +1,137 @@
+#!/bin/bash
+
+# ipset-geoblock version 1.01
+#
+# Modified for ViciBox v.8.1
+#
+# Copyright (C) 2018  James Pearson <jamesp@vicidial.com>    LICENSE: AGPLv2
+#
+# Download country IP assignment from ARIN and block in IPSet
+# This should be ran once upon reboot since IPv4 address' dont change anymore
+#
+# Crontab: @reboot /usr/share/vicibox-firewall/ipset-geoblock >/dev/null 2>&1
+#
+
+# Declared default globals. You likely don't need to edit anything here! Make changes in /etc/vicibox-geoblock.conf!!!
+LOCALCONF="/etc/vicibox-geoblock.conf"
+BADCN=(CN VN RU IN AF UA TW TH SK SI RO PL PK PH LV LU ID HU HR BD)
+IPSET_BIN="/usr/sbin/ipset"
+FIREWALLD_BIN="/usr/bin/firewall-cmd"
+AGGREGATE_BIN="/usr/bin/aggregate"
+RULE='geoblock'
+ARINLIST='/usr/share/vicibox-firewall/delegated-apnic-latest'
+CIDRTMP="/tmp/cidrtemp"
+AGGTMP="/tmp/aggtmpgeo"
+IPSETTMP="/tmp/ipsettmp"
+PATH="/sbin:/usr/sbin:/usr/local/sbin:/root/bin:/usr/local/bin:/usr/bin:/bin" # Makes running from cron easier
+
+# Local our local config overrides to the above if found
+if [ -f $LOCALCONF ]; then
+. $LOCALCONF
+fi
+
+# Generate CIDR netmask from IP range
+function range2nm() {
+  local x=$1 n=2 l=-1
+  if [ "$2" != "" ]; then
+    n=$x x=$2
+  fi
+  while((x)); do
+    let l+=1 x/=n
+  done
+  echo $((32-$l))
+}
+
+
+echo "  Generating Geo Block rules..."
+echo "    Blocked Countries: ${BADCN[@]}"
+
+# Sanity checks
+export PATH
+if [ ! -x $IPSET_BIN ]; then
+  echo "  No $IPSET_BIN found! Is ipset installed?";
+  exit
+fi
+if [ ! -x $FIREWALLD_BIN ]; then
+  echo "  No $FIREWALLD_BIN found! Is firewalld installed?";
+  exit
+fi
+if [ ! -x $AGGREGATE_BIN ]; then
+  echo "  No $AGGREGATE_BIN found! Is aggregate installed?";
+  exit
+fi
+if ! $IPSET_BIN -L $RULE >/dev/null 2>&1 ; then
+  echo -n "  No $RULE IPSet rule found, creating... "
+  $IPSET_BIN -N $RULE nethash -exist
+  echo "done."
+fi
+if [ -f $CIDRTMP ]; then
+  rm $CIDRTMP
+fi
+if [ -f $AGGTMP ]; then
+  rm $AGGTMP
+fi
+if [ -f $IPSETTMP ]; then
+  rm $IPSETTMP
+fi
+touch $IPSETTMP
+touch $CIDRTMP
+touch $AGGTMP
+
+# Parse ARIN file and aggregate it
+if [ -f $ARINLIST ]; then
+  ARINCIDR=''
+  LINENUM=$(cat $ARINLIST | wc -l)
+  echo -n "    Processing APNIC delegation list ($LINENUM entries)... "
+  while read ARINLINE
+  do
+    if [[ $ARINLINE = *"ipv4"* ]]; then
+      OIFS=$IFS
+      IFS='|'
+      IPARY=($ARINLINE)
+      IFS=$OIFS
+      if [[ ${BADCN[*]} =~ ${IPARY[1]} ]]; then
+        ARINIP=${IPARY[3]}
+        ARINNM=$(range2nm ${IPARY[4]})
+        ARINCIDR="$ARINIP/$ARINNM"
+        echo "$ARINCIDR" >> $CIDRTMP
+      fi
+    fi
+  done < $ARINLIST
+  LINENUM=$(cat $CIDRTMP | wc -l)
+  echo "Found $LINENUM entries."
+else
+  echo "  Cannot find APNIC delegation list"
+  exit
+fi
+
+# Reduce rule size by aggregating the list
+echo -n "    Aggregating list... "
+cat $CIDRTMP | aggregate -q -t > $AGGTMP
+if [ $? -ne 0 ]; then
+  echo "  Error!"
+  exit
+else
+  LINENUM=$(cat $AGGTMP | wc -l)
+  echo "now $LINENUM entries."
+fi
+
+# Load aggregation list in IPset
+echo -n "    Generating IPSet rules... "
+while read -r BLIP
+do
+  echo "$BLIP" >> $IPSETTMP
+done < "$AGGTMP"
+echo "done."
+
+echo -n "    Loading rules into $RULE... "
+	$FIREWALLD_BIN --ipset=$RULE --add-entries-from-file=$IPSETTMP
+echo "done."
+
+echo -n "    Cleaning up temporary files... "
+if [ -f $AGGTMP ]; then rm $AGGTMP; fi
+if [ -f $CIDRTMP ]; then rm $CIDRTMP; fi
+if [ -f $IPSETTMP ]; then rm $IPSETTMP; fi
+echo "done."
+echo "  Finished!"
+
