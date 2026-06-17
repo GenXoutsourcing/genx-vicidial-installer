@@ -388,6 +388,15 @@ EOF_HTTPD
         for f in "$REPO_ROOT"/assets/apache/*.conf; do
             [[ -f "$f" ]] || continue
             base="$(basename "$f")"
+
+            # Do not install SSL vhosts yet. Let\'s Encrypt certs do not exist
+            # until configure_ssl_webrtc() runs, and Apache can fail to start if
+            # an SSL config references missing certificate files.
+            if [[ "$base" == *ssl* ]]; then
+                log "Skipping SSL Apache config until certbot completes: $base"
+                continue
+            fi
+
             cp -f "$f" "/etc/httpd/conf.d/genx-$base"
             sed -i 's|/srv/www/vhosts|/var/www/vhosts|g; s|/etc/apache2|/etc/httpd|g; s|apache2|httpd|g' "/etc/httpd/conf.d/genx-$base"
             sed -i "s|DOMAINNAME|$FQDN|g" "/etc/httpd/conf.d/genx-$base"
@@ -811,6 +820,18 @@ configure_ssl_webrtc() {
     systemctl restart httpd
 
     certbot --apache -d "$FQDN" -m "$ADMIN_EMAIL" --agree-tos --non-interactive --redirect
+
+    # Now that Let\'s Encrypt certificates exist, install any bundled SSL Apache configs.
+    if [[ -d "$REPO_ROOT/assets/apache" ]]; then
+        for f in "$REPO_ROOT"/assets/apache/*ssl*.conf; do
+            [[ -f "$f" ]] || continue
+            base="$(basename "$f")"
+            cp -f "$f" "/etc/httpd/conf.d/genx-$base"
+            sed -i 's|/srv/www/vhosts|/var/www/vhosts|g; s|/etc/apache2|/etc/httpd|g; s|apache2|httpd|g' "/etc/httpd/conf.d/genx-$base"
+            sed -i "s|DOMAINNAME|$FQDN|g" "/etc/httpd/conf.d/genx-$base"
+        done
+        systemctl restart httpd
+    fi
 
     # Enable whatever certbot timer exists on this EL9 build.
     if systemctl list-unit-files | grep -q '^certbot-renew.timer'; then
