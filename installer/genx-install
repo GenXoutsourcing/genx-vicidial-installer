@@ -1,10 +1,8 @@
 #!/bin/bash
 # -----------------------------------------------------------------------------
 # GenX VICIdial Installer launcher
-#
-# Target command: genx-install
-# Initial v1 scope: Express server only (DB + Web + Telephony)
-# Future roles are intentionally shown but disabled until Express is proven.
+# Logs to: /var/log/genx-install.log
+# Reads version from: VERSION
 # -----------------------------------------------------------------------------
 
 set -Eeuo pipefail
@@ -12,20 +10,48 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 EXPRESS_SCRIPT="$SCRIPT_DIR/stage1-express.sh"
+VERSION_FILE="$REPO_ROOT/VERSION"
+LOG_FILE="/var/log/genx-install.log"
+
+INSTALLER_VERSION="unknown"
+[[ -f "$VERSION_FILE" ]] && INSTALLER_VERSION="$(cat "$VERSION_FILE" | tr -d '[:space:]')"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE"
+
+log() {
+    echo "$(date '+%F %T') [genx-install v${INSTALLER_VERSION}] $*" | tee -a "$LOG_FILE"
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+on_error() {
+    local exit_code=$?
+    local line_no=$1
+    log "FAILED: command exited with code $exit_code at line $line_no"
+    log "Review log: $LOG_FILE"
+    exit "$exit_code"
+}
+
+trap 'on_error $LINENO' ERR
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "ERROR: Run this installer as root."
-    exit 1
+    die "Run this installer as root."
 fi
 
 if [[ ! -x "$EXPRESS_SCRIPT" ]]; then
-    echo "ERROR: Missing or non-executable: $EXPRESS_SCRIPT"
-    exit 1
+    die "Missing or non-executable: $EXPRESS_SCRIPT"
 fi
 
-cat <<'BANNER'
+clear
+cat <<BANNER
 ==================================================
  GenX VICIdial Installer for AlmaLinux 9
+ Version: ${INSTALLER_VERSION}
+ Log:     ${LOG_FILE}
 ==================================================
 
 Installer v1 focus:
@@ -40,6 +66,9 @@ Future roles:
 
 BANNER
 
+log "Installer launcher started"
+log "Repository root: $REPO_ROOT"
+
 PS3="Select install role: "
 select ROLE in \
     "Express Server - DB + Web + Telephony" \
@@ -51,12 +80,15 @@ select ROLE in \
     "Quit"; do
     case "$REPLY" in
         1)
-            exec "$EXPRESS_SCRIPT" --repo-root "$REPO_ROOT"
+            log "Selected Express Server install"
+            exec "$EXPRESS_SCRIPT" --repo-root "$REPO_ROOT" --version "$INSTALLER_VERSION" --log-file "$LOG_FILE"
             ;;
         2|3|4|5|6)
+            log "Selected planned role: $ROLE"
             echo "This role is planned for a later phase. Build and test Express first."
             ;;
         7)
+            log "User exited installer"
             echo "Exiting."
             exit 0
             ;;
