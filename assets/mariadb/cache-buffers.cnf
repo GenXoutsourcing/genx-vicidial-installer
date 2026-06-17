@@ -1,0 +1,20 @@
+[mysqld]
+### Caches and Buffer settings for MariaDB core as well as MyISAM are in here
+
+# Increase to be approximately 60% of system RAM when you have more then 8GB in the system on a dedicated DB
+key_buffer_size = 4G 
+
+###
+### Most of what's below here will serve you well until you get into the 300+ agent capacity, then the tuning black magic starts
+###
+
+table_open_cache = 4096
+table_definition_cache = 16384
+sort_buffer_size = 4M
+net_buffer_length = 8K
+read_buffer_size = 4M
+read_rnd_buffer_size = 16M
+myisam_sort_buffer_size = 128M
+query_cache_size = 0 # Yes, this will bottleneck your system if you have more then a few thousand QPS, so leave disabled! You've been warned :)
+thread_cache_size = 100
+join_buffer_size = 1M

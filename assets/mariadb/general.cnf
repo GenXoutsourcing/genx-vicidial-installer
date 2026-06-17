@@ -1,0 +1,27 @@
+[mysqld]
+### General settings that control how MariaDB behaves, not so much with DB tuning
+
+max_connections = 2000
+bind-address = 0.0.0.0
+skip-external-locking
+skip-name-resolve
+connect_timeout = 60
+max_allowed_packet = 16M
+long_query_time = 3
+slow-query-log = 1
+slow-query-log-file = /var/lib/mysql/mysqld-slow.log
+log-slow-verbosity = query_plan,explain
+concurrent_insert = 2
+myisam_repair_threads = 4
+myisam_recover_option = DEFAULT
+tmpdir = /tmp/
+myisam_use_mmap = 1
+open_files_limit = 24576
+max_heap_table_size = 512M
+tmp_table_size = 32M
+key_cache_segments = 64
+sql_mode = NO_ENGINE_SUBSTITUTION
+datadir = /srv/mysql/data
+default-storage-engine = MyISAM
+log_warnings = 1 # Silence the noise!!! 2 is default
+explicit_defaults_for_timestamp = Off
