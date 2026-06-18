@@ -37,7 +37,7 @@ ASTERISK_VICIDIAL_VERSION="18"
 DAHDI_VERSION="3.4.0+3.4.0"
 MARIADB_VERSION="native-10.5"
 PHP_STREAM="remi-8.2"
-INSTALLER_VERSION="unknown"
+INSTALLER_VERSION="0.1.6"
 
 # Runtime values; filled by args/prompts.
 REPO_ROOT=""
