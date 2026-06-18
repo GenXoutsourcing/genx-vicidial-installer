@@ -149,6 +149,16 @@ get_primary_private_ip() {
     hostname -I | awk '{print $1}'
 }
 
+get_vicidial_server_ip() {
+    # VICIdial server_ip should match the actual reachable server IP.
+    # On dedicated public servers this is usually the public IP. Fallback to primary local IP.
+    if [[ -n "${PUBLIC_IP:-}" ]]; then
+        echo "$PUBLIC_IP"
+    else
+        get_primary_private_ip
+    fi
+}
+
 get_public_ip() {
     # Multiple providers to avoid one failed endpoint stopping the install.
     curl -4 -fsS https://ifconfig.me 2>/dev/null || \
@@ -553,60 +563,57 @@ install_asterisk() {
     menuselect/menuselect --enable app_meetme menuselect.makeopts || true
     menuselect/menuselect --enable res_http_websocket menuselect.makeopts || true
     menuselect/menuselect --enable res_srtp menuselect.makeopts || true
-    make samples
-    sed -i 's|noload = chan_sip.so|;noload = chan_sip.so|g' /etc/asterisk/modules.conf || true
+
     make -j"$(( $(nproc) + $(nproc) / 2 ))" all
     make install
     ldconfig
+
+    # Some EL9/Asterisk builds do not create all runtime directories before
+    # "make samples" tries to install phone provisioning sample files.
+    mkdir -p /var/lib/asterisk/phoneprov
+    mkdir -p /var/lib/asterisk/sounds
+    mkdir -p /var/lib/asterisk/moh
+    mkdir -p /var/spool/asterisk
+    chown -R root:root /var/lib/asterisk /var/spool/asterisk || true
+
+    # VICIdial overwrites the important config files later, so samples are useful
+    # but should not abort the full installer.
+    make samples || true
+
+    sed -i 's|noload = chan_sip.so|;noload = chan_sip.so|g' /etc/asterisk/modules.conf || true
 
     # VICIdial starts Asterisk through its own boot scripts. Do not enable stock service.
     chkconfig asterisk off 2>/dev/null || true
 }
 
-install_vicidial_source_and_db() {
-    echo
-    echo "=================================================="
-    echo " Installing VICIdial source and database"
-    echo "=================================================="
 
-    mkdir -p /usr/src/astguiclient
-    cd /usr/src/astguiclient
-    if [[ -d trunk/.svn ]]; then
-        svn update trunk
-    else
-        rm -rf trunk
-        svn checkout "$VICIDIAL_SVN" trunk
-    fi
-
-    cd /usr/src/astguiclient/trunk
-    SVN_REVISION="$(svn info 2>/dev/null | awk '/^Revision:/ {print $2}')"
-    log "VICIdial SVN revision: ${SVN_REVISION:-unknown}"
-    echo "SVN_REVISION=${SVN_REVISION:-unknown}" >> "$INFO_FILE"
-
-    mysql <<SQL_VICI
-CREATE DATABASE IF NOT EXISTS asterisk DEFAULT CHARACTER SET utf8 COLLATE utf8_unicode_ci;
-CREATE USER IF NOT EXISTS 'cron'@'localhost' IDENTIFIED BY '${VICI_DB_PASS}';
-CREATE USER IF NOT EXISTS 'cron'@'%' IDENTIFIED BY '${VICI_DB_PASS}';
-GRANT SELECT,CREATE,ALTER,INSERT,UPDATE,DELETE,LOCK TABLES ON asterisk.* TO 'cron'@'localhost';
-GRANT SELECT,CREATE,ALTER,INSERT,UPDATE,DELETE,LOCK TABLES ON asterisk.* TO 'cron'@'%';
-GRANT RELOAD ON *.* TO 'cron'@'localhost';
-GRANT RELOAD ON *.* TO 'cron'@'%';
-CREATE USER IF NOT EXISTS 'custom'@'localhost' IDENTIFIED BY '${VICI_CUSTOM_PASS}';
-CREATE USER IF NOT EXISTS 'custom'@'%' IDENTIFIED BY '${VICI_CUSTOM_PASS}';
-GRANT SELECT,CREATE,ALTER,INSERT,UPDATE,DELETE,LOCK TABLES ON asterisk.* TO 'custom'@'localhost';
-GRANT SELECT,CREATE,ALTER,INSERT,UPDATE,DELETE,LOCK TABLES ON asterisk.* TO 'custom'@'%';
-GRANT RELOAD ON *.* TO 'custom'@'localhost';
-GRANT RELOAD ON *.* TO 'custom'@'%';
+reset_vicidial_database_if_requested() {
+    # Useful during installer development/testing. On a clean server this does nothing.
+    # If an earlier failed run left partial tables/users, this gives a clean asterisk DB.
+    if mysql -NBe "SHOW DATABASES LIKE 'asterisk';" 2>/dev/null | grep -qx 'asterisk'; then
+        echo
+        echo "Existing VICIdial database 'asterisk' detected."
+        echo "For a clean rerun, you can drop/recreate it now."
+        read -rp "Drop and recreate asterisk database and cron/custom DB users? [y/N]: " RESET_AST_DB
+        RESET_AST_DB="${RESET_AST_DB:-N}"
+        if [[ "$RESET_AST_DB" =~ ^[Yy]$ ]]; then
+            log "Dropping existing asterisk database and cron/custom users for clean rerun"
+            mysql <<SQL_RESET_AST
+DROP DATABASE IF EXISTS asterisk;
+DROP USER IF EXISTS 'cron'@'localhost';
+DROP USER IF EXISTS 'cron'@'%';
+DROP USER IF EXISTS 'custom'@'localhost';
+DROP USER IF EXISTS 'custom'@'%';
 FLUSH PRIVILEGES;
-SET GLOBAL connect_timeout=60;
-SQL_VICI
+SQL_RESET_AST
+        else
+            log "Keeping existing asterisk database; SQL imports will use --force where possible"
+        fi
+    fi
+}
 
-    # Use --force so reruns continue if tables already exist from a previous failed test run.
-    mysql --force asterisk < /usr/src/astguiclient/trunk/extras/MySQL_AST_CREATE_tables.sql
-    mysql --force asterisk < /usr/src/astguiclient/trunk/extras/first_server_install.sql
-
-    local ip_address
-    ip_address="$(get_primary_private_ip)"
+write_astguiclient_conf() {
+    local ip_address="$1"
 
     cat > /etc/astguiclient.conf <<EOF_ASTGUI
 # astguiclient.conf - generated by GenX VICIdial installer
@@ -654,78 +661,100 @@ VARDB_user=cron
 VARDB_pass=${VICI_DB_PASS}
 VARDB_port=3306
 EOF_ASTGUI
+}
+
+ensure_vicidial_db_users() {
+    mysql <<SQL_REAPPLY_CREDS
+CREATE USER IF NOT EXISTS 'cron'@'localhost' IDENTIFIED BY '${VICI_DB_PASS}';
+CREATE USER IF NOT EXISTS 'cron'@'%' IDENTIFIED BY '${VICI_DB_PASS}';
+CREATE USER IF NOT EXISTS 'custom'@'localhost' IDENTIFIED BY '${VICI_CUSTOM_PASS}';
+CREATE USER IF NOT EXISTS 'custom'@'%' IDENTIFIED BY '${VICI_CUSTOM_PASS}';
+ALTER USER 'cron'@'localhost' IDENTIFIED BY '${VICI_DB_PASS}';
+ALTER USER 'cron'@'%' IDENTIFIED BY '${VICI_DB_PASS}';
+ALTER USER 'custom'@'localhost' IDENTIFIED BY '${VICI_CUSTOM_PASS}';
+ALTER USER 'custom'@'%' IDENTIFIED BY '${VICI_CUSTOM_PASS}';
+GRANT SELECT,CREATE,ALTER,INSERT,UPDATE,DELETE,LOCK TABLES ON asterisk.* TO 'cron'@'localhost';
+GRANT SELECT,CREATE,ALTER,INSERT,UPDATE,DELETE,LOCK TABLES ON asterisk.* TO 'cron'@'%';
+GRANT SELECT,CREATE,ALTER,INSERT,UPDATE,DELETE,LOCK TABLES ON asterisk.* TO 'custom'@'localhost';
+GRANT SELECT,CREATE,ALTER,INSERT,UPDATE,DELETE,LOCK TABLES ON asterisk.* TO 'custom'@'%';
+GRANT RELOAD ON *.* TO 'cron'@'localhost';
+GRANT RELOAD ON *.* TO 'cron'@'%';
+GRANT RELOAD ON *.* TO 'custom'@'localhost';
+GRANT RELOAD ON *.* TO 'custom'@'%';
+FLUSH PRIVILEGES;
+SQL_REAPPLY_CREDS
+}
+
+install_vicidial_source_and_db() {
+    echo
+    echo "=================================================="
+    echo " Installing VICIdial source and database"
+    echo "=================================================="
+
+    mkdir -p /usr/src/astguiclient
+    cd /usr/src/astguiclient
+    if [[ -d trunk/.svn ]]; then
+        svn update trunk
+    else
+        rm -rf trunk
+        svn checkout "$VICIDIAL_SVN" trunk
+    fi
+
+    cd /usr/src/astguiclient/trunk
+    SVN_REVISION="$(svn info 2>/dev/null | awk '/^Revision:/ {print $2}')"
+    log "VICIdial SVN revision: ${SVN_REVISION:-unknown}"
+    echo "SVN_REVISION=${SVN_REVISION:-unknown}" >> "$INFO_FILE"
+
+    reset_vicidial_database_if_requested
+
+    mysql <<SQL_VICI
+CREATE DATABASE IF NOT EXISTS asterisk DEFAULT CHARACTER SET utf8 COLLATE utf8_unicode_ci;
+SET GLOBAL connect_timeout=60;
+SQL_VICI
+
+    # Always force/reset the cron/custom passwords before install.pl.
+    # CREATE USER IF NOT EXISTS alone does not update passwords on reruns.
+    ensure_vicidial_db_users
+
+    # Use --force so reruns continue if tables already exist from a previous failed test run.
+    mysql --force asterisk < /usr/src/astguiclient/trunk/extras/MySQL_AST_CREATE_tables.sql
+    mysql --force asterisk < /usr/src/astguiclient/trunk/extras/first_server_install.sql
+
+    local ip_address
+    ip_address="$(get_vicidial_server_ip)"
+
+    write_astguiclient_conf "$ip_address"
+    ensure_vicidial_db_users
 
     perl install.pl --web=/var/www/html --asterisk_version=${ASTERISK_VICIDIAL_VERSION} --copy_sample_conf_files --no-prompt --server_ip="$ip_address" \
         --DB_database=asterisk --DB_user=cron --DB_pass="$VICI_DB_PASS" \
         --DB_custom_user=custom --DB_custom_pass="$VICI_CUSTOM_PASS" --DB_port=3306
 
+    # This second run mirrors common VICIdial install flows, but it may emit harmless
+    # "file exists" warnings on reruns.
     perl install.pl --no-prompt || true
 
     # install.pl can overwrite /etc/astguiclient.conf and/or reset expectations.
     # Re-write our known-good astguiclient.conf and re-apply DB credentials after install.pl.
-    cat > /etc/astguiclient.conf <<EOF_ASTGUI2
-# astguiclient.conf - generated by GenX VICIdial installer
-PATHhome => /usr/share/astguiclient
-PATHlogs => /var/log/astguiclient
-PATHagi => /var/lib/asterisk/agi-bin
-PATHweb => /var/www/html
-PATHsounds => /var/lib/asterisk/sounds
-PATHmonitor => /var/spool/asterisk/monitor
-PATHDONEmonitor => /var/spool/asterisk/monitorDONE
-VARserver_ip => ${ip_address}
-VARDB_server => localhost
-VARDB_database => asterisk
-VARDB_user => cron
-VARDB_pass => ${VICI_DB_PASS}
-VARDB_custom_user => custom
-VARDB_custom_pass => ${VICI_CUSTOM_PASS}
-VARDB_port => 3306
-VARactive_keepalives => 123456789ECS
-VARasterisk_version => 18.X
-VARFTP_host => ${ip_address}
-VARFTP_user => cronarchive
-VARFTP_pass => ${VICI_DB_PASS}
-VARFTP_port => 21
-VARFTP_dir => RECORDINGS
-VARHTTP_path => https://${FQDN}
-VARREPORT_host => ${ip_address}
-VARREPORT_user => cronarchive
-VARREPORT_pass => ${VICI_DB_PASS}
-VARREPORT_port => 21
-VARREPORT_dir => REPORTS
-VARfastagi_log_min_servers => 3
-VARfastagi_log_max_servers => 16
-VARfastagi_log_min_spare_servers => 2
-VARfastagi_log_max_spare_servers => 8
-VARfastagi_log_max_requests => 1000
-VARfastagi_log_checkfordead => 30
-VARfastagi_log_checkforwait => 60
-ExpectedDBSchema => 1743
-
-# Compatibility lines for VICIdial PHP dbconnect parsers that expect "=" syntax
-VARDB_server=localhost
-VARDB_database=asterisk
-VARDB_user=cron
-VARDB_pass=${VICI_DB_PASS}
-VARDB_port=3306
-EOF_ASTGUI2
-
-    mysql <<SQL_REAPPLY_CREDS
-ALTER USER 'cron'@'localhost' IDENTIFIED BY '${VICI_DB_PASS}';
-ALTER USER 'cron'@'%' IDENTIFIED BY '${VICI_DB_PASS}';
-ALTER USER 'custom'@'localhost' IDENTIFIED BY '${VICI_CUSTOM_PASS}';
-ALTER USER 'custom'@'%' IDENTIFIED BY '${VICI_CUSTOM_PASS}';
-FLUSH PRIVILEGES;
-SQL_REAPPLY_CREDS
+    write_astguiclient_conf "$ip_address"
+    ensure_vicidial_db_users
 
     # Secure Asterisk Manager to localhost.
     sed -i 's/0.0.0.0/127.0.0.1/g' /etc/asterisk/manager.conf || true
 
-    # first_server_install.sql creates sample server records using 10.10.10.15 and old Asterisk versions.
-    # Convert every relevant VICIdial table to this server IP and Asterisk 18 before keepalives run.
-    mysql asterisk <<SQL_SERVER_IP
+    # first_server_install.sql creates sample server records using 10.10.10.15.
+    # Use VICIdial's official helper to update the many related tables. Avoid direct
+    # UPDATEs on phones/conferences because reruns can hit unique keys like extenserver.
+    if [[ -x /usr/share/astguiclient/ADMIN_update_server_ip.pl ]]; then
+        printf "n\n" | /usr/share/astguiclient/ADMIN_update_server_ip.pl --old-server_ip=10.10.10.15 --server_ip="$ip_address" || true
+    fi
+
+    # Final hardening of the server row after the official IP helper runs.
+    mysql asterisk <<SQL_SERVER_FINAL
 UPDATE servers
-SET server_ip='${ip_address}',
+SET server_id='vicidial',
+    server_description='${FQDN}',
+    server_ip='${ip_address}',
     active='Y',
     active_asterisk_server='Y',
     active_agent_login_server='Y',
@@ -735,40 +764,19 @@ SET server_ip='${ip_address}',
     auto_restart_asterisk='Y',
     vicidial_balance_active='Y',
     rebuild_conf_files='Y',
-    server_description='Server ${FQDN}',
     conf_secret='${RANDOM_AUTH}',
     recording_web_link='ALT_IP',
     alt_server_ip='${FQDN}'
-WHERE server_ip='10.10.10.15' OR server_ip='${ip_address}';
+WHERE server_ip='${ip_address}' OR server_ip='10.10.10.15' OR server_id IN ('demo','vicidial');
 
 UPDATE system_settings
 SET active_voicemail_server='${ip_address}',
     webphone_url='https://phone.viciphone.com/viciphone.php',
     sounds_web_server='https://${FQDN}';
+SQL_SERVER_FINAL
 
-UPDATE phones SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE conferences SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE vicidial_conferences SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE vicidial_confbridges SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE vicidial_server_trunks SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE vicidial_server_carriers SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE vicidial_inbound_dids SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE vicidial_inbound_dids SET filter_server_ip='${ip_address}' WHERE filter_server_ip='10.10.10.15';
-UPDATE vicidial_process_triggers SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE inbound_numbers SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE server_updater SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE vicidial_stations SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE vicidial_remote_agents SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-UPDATE phone_favorites SET server_ip='${ip_address}' WHERE server_ip='10.10.10.15';
-SQL_SERVER_IP
-
-    # Also run VICIdial's official IP update helper in non-interactive mode when available.
-    # It updates extra tables and marks conf files for rebuild. The SQL above already handles
-    # the critical tables, so this is allowed to fail without aborting the installer.
-    if [[ -x /usr/share/astguiclient/ADMIN_update_server_ip.pl ]]; then
-        printf "n\n" | /usr/share/astguiclient/ADMIN_update_server_ip.pl --old-server_ip=10.10.10.15 --server_ip="$ip_address" || true
-    fi
-
+    # ViciBox helper table: keep server short ("vicidial") and put the FQDN in the
+    # VICIdial servers.server_description field. The vicibox.server column is short.
     mysql asterisk <<SQL_VBOX
 CREATE TABLE IF NOT EXISTS vicibox (
   server_id tinyint(3) unsigned NOT NULL AUTO_INCREMENT,
@@ -786,15 +794,13 @@ CREATE TABLE IF NOT EXISTS vicibox (
   field9 varchar(64) DEFAULT NULL,
   PRIMARY KEY (server_id)
 ) ENGINE=MyISAM DEFAULT CHARSET=latin1;
-DELETE FROM vicibox WHERE server='${FQDN}' OR server_ip='${ip_address}';
+DELETE FROM vicibox WHERE server='vicidial' OR server_ip='${ip_address}';
 INSERT INTO vicibox (server, server_ip, server_type, field1, field2, field3, field4, field5, field6, field7, field8, field9)
-VALUES ('${FQDN}', '${ip_address}', 'Database', '1', 'asterisk', '${SVN_REVISION:-unknown}', 'cron', '${VICI_DB_PASS}', 'custom', '${VICI_CUSTOM_PASS}', 'repl', 'AUTO_GENERATE_LATER');
+VALUES ('vicidial', '${ip_address}', 'Database', '1', 'asterisk', '${SVN_REVISION:-unknown}', 'cron', '${VICI_DB_PASS}', 'custom', '${VICI_CUSTOM_PASS}', 'repl', 'AUTO_GENERATE_LATER');
 INSERT INTO vicibox (server, server_ip, server_type, field1, field2)
-VALUES ('${FQDN}', '${ip_address}', 'Web', '${PUBLIC_IP}', '${RANDOM_AUTH}');
+VALUES ('vicidial', '${ip_address}', 'Web', '${PUBLIC_IP}', '${RANDOM_AUTH}');
 INSERT INTO vicibox (server, server_ip, server_type, field1)
-VALUES ('${FQDN}', '${ip_address}', 'Telephony', '${PUBLIC_IP}');
-UPDATE servers SET server_description='Server ${FQDN}', asterisk_version='${ASTERISK_VICIDIAL_VERSION}', conf_secret='${RANDOM_AUTH}', vicidial_balance_active='Y', auto_restart_asterisk='Y', recording_web_link='ALT_IP', alt_server_ip='${FQDN}', conf_engine='CONFBRIDGE' WHERE server_ip='${ip_address}';
-UPDATE system_settings SET active_voicemail_server='${ip_address}', webphone_url='https://phone.viciphone.com/viciphone.php', sounds_web_server='https://${FQDN}';
+VALUES ('vicidial', '${ip_address}', 'Telephony', '${PUBLIC_IP}');
 SQL_VBOX
 }
 
@@ -805,7 +811,7 @@ install_confbridge_records() {
     echo "=================================================="
 
     local ip_address
-    ip_address="$(get_primary_private_ip)"
+    ip_address="$(get_vicidial_server_ip)"
 
     mysql asterisk -e "DELETE FROM vicidial_confbridges WHERE conf_exten BETWEEN 9600000 AND 9600299;"
     for i in $(seq 0 299); do
@@ -1122,7 +1128,7 @@ start_and_verify_vicidial() {
     echo "=================================================="
 
     local ip_address
-    ip_address="$(get_primary_private_ip)"
+    ip_address="$(get_vicidial_server_ip)"
 
     mysql asterisk <<SQL_FINAL_SERVER
 UPDATE servers
