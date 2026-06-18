@@ -110,6 +110,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# If stage1 is executed directly, try to read VERSION from the repo so logs do not show vunknown.
+if [[ "${INSTALLER_VERSION}" == "unknown" && -n "${REPO_ROOT}" && -f "${REPO_ROOT}/VERSION" ]]; then
+    INSTALLER_VERSION="$(tr -d '[:space:]' < "${REPO_ROOT}/VERSION")"
+fi
+
 require_root() {
     [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run this script as root."
 }
@@ -300,6 +305,7 @@ install_repos_and_base_packages() {
         wget curl git subversion screen tmux nano vim unzip tar rsync patch make gcc gcc-c++ \
         perl perl-CPAN perl-YAML perl-CPAN-DistnameInfo perl-libwww-perl perl-DBI perl-DBD-MySQL \
         perl-GD perl-Env perl-Term-ReadLine-Gnu perl-SelfLoader perl-File-Which perl-ExtUtils-MakeMaker \
+        perl-Net-Telnet perl-Net-Server perl-Switch perl-App-cpanminus perl-LWP-Protocol-https perl-IO-Socket-SSL \
         ImageMagick sox sendmail lame-devel htop iftop atop mytop inxi bind-utils \
         kernel-devel-$(uname -r) kernel-headers-$(uname -r) elfutils-libelf-devel \
         newt newt-devel slang-devel ncurses-devel libxml2-devel sqlite-devel libuuid-devel \
@@ -313,6 +319,35 @@ install_repos_and_base_packages() {
 
     pip3 install --upgrade pip || true
     pip3 install mysql-connector-python || true
+}
+
+ensure_perl_runtime_modules() {
+    echo
+    echo "=================================================="
+    echo " Verifying VICIdial Perl runtime modules"
+    echo "=================================================="
+
+    # VICIdial daemon screens need these. Missing modules cause ASTupdate,
+    # ASTlisten, ASTsend, ASTconf3way and FastAGI_log to start then die.
+    dnf -y install \
+        perl-Net-Telnet \
+        perl-Net-Server \
+        perl-Switch \
+        perl-App-cpanminus \
+        perl-LWP-Protocol-https \
+        perl-IO-Socket-SSL \
+        perl-libwww-perl
+
+    perl -MNet::Telnet -e 'print "Net::Telnet OK\n"'
+    perl -MNet::Server -e 'print "Net::Server OK\n"'
+    perl -MSwitch -e 'print "Switch OK\n"'
+
+    if ! perl -MAsterisk::AGI -e 'print "Asterisk::AGI OK\n"' 2>/dev/null; then
+        log "Installing Asterisk::AGI from CPAN"
+        cpanm --notest Asterisk::AGI || perl -MCPAN -e 'CPAN::Shell->notest("install", "Asterisk::AGI")' || true
+    fi
+
+    perl -MAsterisk::AGI -e 'print "Asterisk::AGI OK\n"'
 }
 
 install_mariadb() {
@@ -825,6 +860,21 @@ install_confbridge_records() {
     fi
 }
 
+fix_asterisk_placeholders() {
+    local ip_address
+    ip_address="$(get_vicidial_server_ip)"
+
+    log "Replacing Asterisk placeholder values with IP ${ip_address} and FQDN ${FQDN}"
+    sed -i "s/SERVER_EXTERNAL_IP/${ip_address}/g" /etc/asterisk/*.conf 2>/dev/null || true
+    sed -i "s/SERVER_GUEST_IP/${ip_address}/g" /etc/asterisk/*.conf 2>/dev/null || true
+    sed -i "s/SERVER_HOSTNAME/${FQDN}/g" /etc/asterisk/*.conf 2>/dev/null || true
+
+    if grep -R "SERVER_EXTERNAL_IP\|SERVER_GUEST_IP\|SERVER_HOSTNAME" /etc/asterisk/*.conf >/tmp/genx-asterisk-placeholders.txt 2>/dev/null; then
+        log "WARNING: Asterisk placeholders still found:"
+        cat /tmp/genx-asterisk-placeholders.txt || true
+    fi
+}
+
 install_cron_and_boot() {
     echo
     echo "=================================================="
@@ -1144,11 +1194,27 @@ SET active='Y',
 WHERE server_ip='${ip_address}';
 SQL_FINAL_SERVER
 
-    /usr/share/astguiclient/start_asterisk_boot.pl || true
-    sleep 5
+    fix_asterisk_placeholders
 
+    /usr/share/astguiclient/start_asterisk_boot.pl || true
+    sleep 8
+
+    # Load/reload core pieces before keepalive starts the AMI/ConfBridge daemons.
+    asterisk -rx "module load app_confbridge.so" || true
+    asterisk -rx "module reload" || true
+    asterisk -rx "manager reload" || true
+
+    # First run rebuilds auto-generated configs and may start only a subset of screens.
     /usr/share/astguiclient/ADMIN_keepalive_ALL.pl --cu3way || true
-    sleep 10
+    sleep 8
+
+    # Re-run after config generation/reload so ASTupdate/ASTlisten/ASTsend/ASTconf3way
+    # and FastAGI_log are started and remain alive.
+    fix_asterisk_placeholders
+    asterisk -rx "module reload" || true
+    asterisk -rx "manager reload" || true
+    /usr/share/astguiclient/ADMIN_keepalive_ALL.pl --cu3way || true
+    sleep 12
 
     screen -ls || true
 
@@ -1189,6 +1255,7 @@ BANNER
     save_install_info_header
 
     install_repos_and_base_packages
+    ensure_perl_runtime_modules
     install_mariadb
     install_php_httpd
     install_lame_jansson_srtp
@@ -1196,10 +1263,12 @@ BANNER
     install_asterisk
     install_vicidial_source_and_db
     install_confbridge_records
+    fix_asterisk_placeholders
     install_sounds_and_codecs
     install_dynportal_firewall
     install_cron_and_boot
     configure_ssl_webrtc
+    fix_asterisk_placeholders
     start_and_verify_vicidial
     fix_permissions_and_limits
 
