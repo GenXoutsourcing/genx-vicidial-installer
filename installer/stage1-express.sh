@@ -307,7 +307,7 @@ install_repos_and_base_packages() {
         perl-GD perl-Env perl-Term-ReadLine-Gnu perl-SelfLoader perl-File-Which perl-ExtUtils-MakeMaker \
         perl-Net-Telnet perl-Net-Server perl-Switch perl-App-cpanminus perl-LWP-Protocol-https perl-IO-Socket-SSL \
         ImageMagick sox sendmail lame-devel htop iftop atop mytop inxi bind-utils \
-        kernel-devel-$(uname -r) kernel-headers-$(uname -r) elfutils-libelf-devel \
+        kernel-devel-$(uname -r) kernel-headers elfutils-libelf-devel \
         newt newt-devel slang-devel ncurses-devel libxml2-devel sqlite-devel libuuid-devel \
         libedit-devel readline-devel speex-devel openssl-devel libsrtp-devel uuid-devel \
         httpd mod_ssl certbot python3-certbot-apache firewalld vsftpd ftp postfix dovecot s-nail \
