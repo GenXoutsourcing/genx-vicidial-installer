@@ -53,6 +53,7 @@ SVN_REVISION=""
 RECORDING_RETENTION_DAYS=""
 GENX_TZ=""
 LETSENCRYPT_STAGING=""
+SERVER_ID=""
 
 # Shared logging. genx-install passes --log-file; if run directly, use default.
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -175,6 +176,12 @@ get_system_timezone() {
     timedatectl show -p Timezone --value 2>/dev/null || echo "America/New_York"
 }
 
+get_server_id() {
+    # VICIdial server_id should be short, like ALMA9 or SIP1.
+    # Derived from the short hostname after hostnamectl sets the FQDN.
+    hostname -s | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9_-]/_/g'
+}
+
 prompt_server_info() {
     echo
     echo "=================================================="
@@ -215,6 +222,9 @@ prompt_server_info() {
 
     log "Setting hostname to $FQDN"
     hostnamectl set-hostname "$FQDN"
+    SERVER_ID="$(get_server_id)"
+    [[ -n "$SERVER_ID" ]] || SERVER_ID="VICIDIAL"
+    log "Using VICIdial server_id: $SERVER_ID"
     log "Using PHP/application timezone: $GENX_TZ"
 }
 
@@ -256,6 +266,7 @@ Installer Version: ${INSTALLER_VERSION}
 Generated: $(date)
 
 FQDN=$FQDN
+SERVER_ID=$SERVER_ID
 ADMIN_EMAIL=$ADMIN_EMAIL
 PUBLIC_IP=$PUBLIC_IP
 PRIVATE_IP=$(get_primary_private_ip)
@@ -696,6 +707,7 @@ VARDB_user=cron
 VARDB_pass=${VICI_DB_PASS}
 VARDB_port=3306
 EOF_ASTGUI
+    chmod 644 /etc/astguiclient.conf || true
 }
 
 ensure_vicidial_db_users() {
@@ -787,14 +799,14 @@ SQL_VICI
     # Final hardening of the server row after the official IP helper runs.
     mysql asterisk <<SQL_SERVER_FINAL
 UPDATE servers
-SET server_id='vicidial',
+SET server_id='${SERVER_ID}',
     server_description='${FQDN}',
     server_ip='${ip_address}',
     active='Y',
     active_asterisk_server='Y',
     active_agent_login_server='Y',
     generate_vicidial_conf='Y',
-    asterisk_version='${ASTERISK_VICIDIAL_VERSION}',
+    asterisk_version='${ASTERISK_SOURCE_VERSION}',
     conf_engine='CONFBRIDGE',
     auto_restart_asterisk='Y',
     vicidial_balance_active='Y',
@@ -802,7 +814,7 @@ SET server_id='vicidial',
     conf_secret='${RANDOM_AUTH}',
     recording_web_link='ALT_IP',
     alt_server_ip='${FQDN}'
-WHERE server_ip='${ip_address}' OR server_ip='10.10.10.15' OR server_id IN ('demo','vicidial');
+WHERE server_ip='${ip_address}' OR server_ip='10.10.10.15' OR server_id IN ('demo','vicidial','${SERVER_ID}');
 
 UPDATE system_settings
 SET active_voicemail_server='${ip_address}',
@@ -810,7 +822,7 @@ SET active_voicemail_server='${ip_address}',
     sounds_web_server='https://${FQDN}';
 SQL_SERVER_FINAL
 
-    # ViciBox helper table: keep server short ("vicidial") and put the FQDN in the
+    # ViciBox helper table: keep server short (SERVER_ID) and put the FQDN in the
     # VICIdial servers.server_description field. The vicibox.server column is short.
     mysql asterisk <<SQL_VBOX
 CREATE TABLE IF NOT EXISTS vicibox (
@@ -829,13 +841,13 @@ CREATE TABLE IF NOT EXISTS vicibox (
   field9 varchar(64) DEFAULT NULL,
   PRIMARY KEY (server_id)
 ) ENGINE=MyISAM DEFAULT CHARSET=latin1;
-DELETE FROM vicibox WHERE server='vicidial' OR server_ip='${ip_address}';
+DELETE FROM vicibox WHERE server='${SERVER_ID}' OR server='vicidial' OR server_ip='${ip_address}';
 INSERT INTO vicibox (server, server_ip, server_type, field1, field2, field3, field4, field5, field6, field7, field8, field9)
-VALUES ('vicidial', '${ip_address}', 'Database', '1', 'asterisk', '${SVN_REVISION:-unknown}', 'cron', '${VICI_DB_PASS}', 'custom', '${VICI_CUSTOM_PASS}', 'repl', 'AUTO_GENERATE_LATER');
+VALUES ('${SERVER_ID}', '${ip_address}', 'Database', '1', 'asterisk', '${SVN_REVISION:-unknown}', 'cron', '${VICI_DB_PASS}', 'custom', '${VICI_CUSTOM_PASS}', 'repl', 'AUTO_GENERATE_LATER');
 INSERT INTO vicibox (server, server_ip, server_type, field1, field2)
-VALUES ('vicidial', '${ip_address}', 'Web', '${PUBLIC_IP}', '${RANDOM_AUTH}');
+VALUES ('${SERVER_ID}', '${ip_address}', 'Web', '${PUBLIC_IP}', '${RANDOM_AUTH}');
 INSERT INTO vicibox (server, server_ip, server_type, field1)
-VALUES ('vicidial', '${ip_address}', 'Telephony', '${PUBLIC_IP}');
+VALUES ('${SERVER_ID}', '${ip_address}', 'Telephony', '${PUBLIC_IP}');
 SQL_VBOX
 }
 
@@ -933,6 +945,9 @@ modprobe dahdi_dummy || true
 /usr/sbin/dahdi_cfg -vvvvvvvvvvvvv || true
 sleep 20
 /usr/share/astguiclient/start_asterisk_boot.pl || true
+# Give Asterisk/AMI time to become ready, then force keepalive once at boot.
+sleep 45
+/usr/share/astguiclient/ADMIN_keepalive_ALL.pl --cu3way || true
 exit 0
 EOF_RC
     chmod +x /etc/rc.d/rc.local
@@ -966,6 +981,7 @@ install_dynportal_firewall() {
     mkdir -p /var/www/vhosts/dynportal
     cp -a "$REPO_ROOT/assets/dynportal/." /var/www/vhosts/dynportal/
     chown -R apache:apache /var/www/vhosts/dynportal
+    chmod 755 /var/www /var/www/vhosts || true
     find /var/www/vhosts/dynportal -type d -exec chmod 755 {} \;
     find /var/www/vhosts/dynportal -type f -exec chmod 644 {} \;
 
@@ -1167,6 +1183,15 @@ fix_permissions_and_limits() {
     find /var/spool/asterisk -type d -exec chmod 775 {} \; || true
     find /var/spool/asterisk -type f -exec chmod 664 {} \; || true
 
+    # Web/PHP needs to read astguiclient.conf for DB credentials, and Apache
+    # needs search permissions through /var/www/vhosts for dynportal aliases.
+    chmod 644 /etc/astguiclient.conf || true
+    chmod 755 /var/www /var/www/vhosts || true
+    chown -R apache:apache /var/www/vhosts/dynportal || true
+    find /var/www/vhosts/dynportal -type d -exec chmod 755 {} \; || true
+    find /var/www/vhosts/dynportal -type f -exec chmod 644 {} \; || true
+    chmod 644 /var/www/html/index.html || true
+
     dnf -y remove kernel-debug* || true
 }
 
@@ -1186,7 +1211,7 @@ SET active='Y',
     active_asterisk_server='Y',
     active_agent_login_server='Y',
     generate_vicidial_conf='Y',
-    asterisk_version='${ASTERISK_VICIDIAL_VERSION}',
+    asterisk_version='${ASTERISK_SOURCE_VERSION}',
     conf_engine='CONFBRIDGE',
     auto_restart_asterisk='Y',
     vicidial_balance_active='Y',
@@ -1200,7 +1225,9 @@ SQL_FINAL_SERVER
     sleep 8
 
     # Load/reload core pieces before keepalive starts the AMI/ConfBridge daemons.
-    asterisk -rx "module load app_confbridge.so" || true
+    if ! asterisk -rx "module show like confbridge" | grep -q "app_confbridge.so.*Running"; then
+        asterisk -rx "module load app_confbridge.so" || true
+    fi
     asterisk -rx "module reload" || true
     asterisk -rx "manager reload" || true
 
@@ -1230,6 +1257,10 @@ SQL_FINAL_SERVER
     asterisk -rx "core show version" || true
     asterisk -rx "http show status" || true
     asterisk -rx "manager show connected" || true
+
+    if ! asterisk -rx "module show like confbridge" | grep -q "app_confbridge.so.*Running"; then
+        log "WARNING: app_confbridge.so is not Running after keepalive."
+    fi
 }
 
 main() {
